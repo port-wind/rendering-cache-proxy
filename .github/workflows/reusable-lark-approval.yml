@@ -1,0 +1,229 @@
+name: Reusable Lark Approval
+
+on:
+  workflow_call:
+    inputs:
+      project_type:
+        required: true
+        type: string
+      project_name:
+        required: true
+        type: string
+      version:
+        required: false
+        type: string
+        default: "latest"
+      change_log:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      LARK_APP_ID:
+        required: true
+      LARK_APP_SECRET:
+        required: true
+      LARK_CHAT_ID:
+        required: true
+      APPROVAL_CALLBACK_BASE:
+        required: true
+      CALLBACK_SIGN:
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  create_gate:
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.mk.outputs.issue_number }}
+      issue_url: ${{ steps.mk.outputs.issue_url }}
+    steps:
+      - name: Create approval issue
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const title = `[${{ inputs.project_name }}] Production 发布审批 - ${{ inputs.version }}`;
+            const body = [
+              `### 📋 发布信息`,
+              `- **项目**: ${{ inputs.project_name }}`,
+              `- **类型**: ${{ inputs.project_type }}`,
+              `- **版本**: ${{ inputs.version }}`,
+              `- **说明**: ${{ inputs.change_log || '无' }}`,
+              `- **触发者**: Jenkins`,
+              "",
+              `_请在飞书里点击按钮 同意/拒绝_`
+            ].join("\n");
+            const { data } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body
+            });
+            core.setOutput("issue_number", String(data.number));
+            core.setOutput("issue_url", data.html_url);
+
+  notify_approval:
+    needs: create_gate
+    runs-on: ubuntu-latest
+    env:
+      LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+      LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+      LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+      CALLBACK_BASE: ${{ secrets.APPROVAL_CALLBACK_BASE }}
+    steps:
+      - name: Ensure jq
+        run: |
+          command -v jq >/dev/null 2>&1 || {
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          }
+
+      - name: Get tenant_access_token
+        id: tat
+        shell: bash
+        run: |
+          TAT="$(curl -sS -X POST 'https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal' \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "{\"app_id\":\"$LARK_APP_ID\",\"app_secret\":\"$LARK_APP_SECRET\"}" | jq -r '.tenant_access_token')"
+          test -n "$TAT" && [ "$TAT" != "null" ] || { echo "get TAT failed"; exit 1; }
+          echo "token=$TAT" >> $GITHUB_OUTPUT
+
+      - name: Send approval card
+        id: send
+        shell: bash
+        env:
+          TAT: ${{ steps.tat.outputs.token }}
+        run: |
+          set -euo pipefail
+          
+          REPO="${{ github.repository }}"
+          ISSUE="${{ needs.create_gate.outputs.issue_number }}"
+          
+          CARD_CONTENT=$(jq -n \
+            --arg project "${{ inputs.project_name }}" \
+            --arg repo "$REPO" \
+            --arg version "${{ inputs.version }}" \
+            --arg type "${{ inputs.project_type }}" \
+            --arg change_log "${{ inputs.change_log }}" \
+            --arg issue "$ISSUE" \
+            --arg callback_sign "${{ secrets.CALLBACK_SIGN }}" \
+            '{
+              "config": {"wide_screen_mode": true},
+              "header": {
+                "title": {"tag": "plain_text", "content": "🚀 Production 发布审批"},
+                "template": "blue"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "fields": [
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**📦 项目**: " + $project)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**🏷️ 版本**: " + $version)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**🔧 类型**: " + $type)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": "**🌍 环境**: Production"}}
+                  ]
+                },
+                {"tag": "hr"},
+                {
+                  "tag": "div",
+                  "text": {"tag": "lark_md", "content": ("**📝 变更说明**:\n" + (if ($change_log == "") then "无" else $change_log end))}
+                },
+                {"tag": "hr"},
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {"tag": "plain_text", "content": "✅ 同意发布"},
+                      "type": "primary",
+                      "value": {
+                        "action": "approve",
+                        "repo": $repo,
+                        "issue_number": $issue,
+                        "sign": $callback_sign
+                      }
+                    },
+                    {
+                      "tag": "button",
+                      "text": {"tag": "plain_text", "content": "❌ 拒绝发布"},
+                      "type": "danger",
+                      "value": {
+                        "action": "reject",
+                        "repo": $repo,
+                        "issue_number": $issue,
+                        "sign": $callback_sign
+                      }
+                    }
+                  ]
+                }
+              ]
+            }')
+          
+          CARD_STR=$(echo "$CARD_CONTENT" | jq -c . | jq -Rs .)
+          
+          SEND_PAYLOAD=$(jq -n \
+            --arg chat_id "$LARK_CHAT_ID" \
+            --argjson card_str "$CARD_STR" \
+            '{
+              "receive_id": $chat_id,
+              "msg_type": "interactive",
+              "content": $card_str
+            }')
+          
+          RESP=$(curl -sS -X POST 'https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id' \
+            -H "Authorization: Bearer $TAT" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "$SEND_PAYLOAD")
+          
+          echo "$RESP" | jq .
+          echo "$RESP" | jq -e '.code == 0' || exit 1
+
+  wait_approval:
+    needs: [create_gate, notify_approval]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      approved: ${{ steps.check.outputs.approved }}
+    steps:
+      - name: Wait for approval
+        id: check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const issueNumber = ${{ needs.create_gate.outputs.issue_number }};
+            const maxAttempts = 120;
+            let attempts = 0;
+            
+            while (attempts < maxAttempts) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              const approvalComment = comments.find(c => 
+                c.body && (c.body.includes('✅ APPROVED') || c.body.includes('❌ REJECTED'))
+              );
+              
+              if (approvalComment) {
+                if (approvalComment.body.includes('✅ APPROVED')) {
+                  core.setOutput('approved', 'true');
+                  console.log('✅ Deployment approved');
+                  return;
+                } else {
+                  core.setFailed('❌ Deployment rejected');
+                  return;
+                }
+              }
+              
+              attempts++;
+              await new Promise(resolve => setTimeout(resolve, 30000));
+            }
+            
+            core.setFailed('⏱️ Approval timeout (60 minutes)');
