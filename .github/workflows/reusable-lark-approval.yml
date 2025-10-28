@@ -1,0 +1,244 @@
+name: Reusable Lark Approval
+
+on:
+  workflow_call:
+    inputs:
+      project_type:
+        required: true
+        type: string
+      project_name:
+        required: true
+        type: string
+      version:
+        required: false
+        type: string
+        default: "latest"
+      change_log:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      LARK_APP_ID:
+        required: true
+      LARK_APP_SECRET:
+        required: true
+      LARK_CHAT_ID:
+        required: true
+      APPROVAL_CALLBACK_BASE:
+        required: true
+      CALLBACK_SIGN:
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  create_gate:
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.mk.outputs.issue_number }}
+      issue_url: ${{ steps.mk.outputs.issue_url }}
+    steps:
+      - name: Create approval issue
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const title = `[${{ inputs.project_name }}] Production 发布审批 - ${{ inputs.version }}`;
+            const body = [
+              `### 📋 发布信息`,
+              `- **项目**: ${{ inputs.project_name }}`,
+              `- **类型**: ${{ inputs.project_type }}`,
+              `- **版本**: ${{ inputs.version }}`,
+              `- **说明**: ${{ inputs.change_log || '无' }}`,
+              `- **触发者**: Jenkins`,
+              "",
+              `_请在飞书里点击按钮 同意/拒绝_`
+            ].join("\n");
+            const { data } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body
+            });
+            core.setOutput("issue_number", String(data.number));
+            core.setOutput("issue_url", data.html_url);
+
+  notify_approval:
+    needs: create_gate
+    runs-on: ubuntu-latest
+    env:
+      LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+      LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+      LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+      CALLBACK_BASE: ${{ secrets.APPROVAL_CALLBACK_BASE }}
+    steps:
+      - name: Ensure jq
+        run: |
+          command -v jq >/dev/null 2>&1 || {
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          }
+
+      - name: Get tenant_access_token
+        id: tat
+        shell: bash
+        run: |
+          TAT="$(curl -sS -X POST 'https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal' \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "{\"app_id\":\"$LARK_APP_ID\",\"app_secret\":\"$LARK_APP_SECRET\"}" | jq -r '.tenant_access_token')"
+          test -n "$TAT" && [ "$TAT" != "null" ] || { echo "get TAT failed"; exit 1; }
+          echo "token=$TAT" >> $GITHUB_OUTPUT
+
+      - name: Send approval card
+        id: send
+        shell: bash
+        env:
+          TAT: ${{ steps.tat.outputs.token }}
+        run: |
+          set -euo pipefail
+          
+          REPO="${{ github.repository }}"
+          ISSUE="${{ needs.create_gate.outputs.issue_number }}"
+          WORKER_URL="${CALLBACK_BASE}"
+          
+          TEMP_CARD=$(jq -n \
+            --arg project "${{ inputs.project_name }}" \
+            --arg repo "$REPO" \
+            --arg version "${{ inputs.version }}" \
+            --arg type "${{ inputs.project_type }}" \
+            --arg change_log "${{ inputs.change_log }}" \
+            --arg issue "$ISSUE" \
+            --arg callback_sign "${{ secrets.CALLBACK_SIGN }}" \
+            '{
+              "config": {"wide_screen_mode": true},
+              "header": {
+                "title": {"tag": "plain_text", "content": "🚀 Production 发布审批"},
+                "template": "blue"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "fields": [
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**📦 项目**: " + $project)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**🏷️ 版本**: " + $version)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": ("**🔧 类型**: " + $type)}},
+                    {"is_short": true, "text": {"tag": "lark_md", "content": "**🌍 环境**: Production"}}
+                  ]
+                },
+                {"tag": "hr"},
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": ("**📝 变更说明**:\n" + (if $change_log == "" then "无" else $change_log end))
+                  }
+                },
+                {"tag": "hr"},
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {"tag": "plain_text", "content": "✅ 同意发布"},
+                      "type": "primary",
+                      "value": {
+                        "action": "approve",
+                        "repo": $repo,
+                        "issue": $issue,
+                        "sign": $callback_sign
+                      }
+                    },
+                    {
+                      "tag": "button",
+                      "text": {"tag": "plain_text", "content": "❌ 拒绝发布"},
+                      "type": "danger",
+                      "value": {
+                        "action": "reject",
+                        "repo": $repo,
+                        "issue": $issue,
+                        "sign": $callback_sign
+                      }
+                    }
+                  ]
+                }
+              ]
+            }')
+          
+          PAYLOAD=$(jq -n \
+            --arg chat_id "$LARK_CHAT_ID" \
+            --argjson card "$TEMP_CARD" \
+            '{
+              "receive_id": $chat_id,
+              "msg_type": "interactive",
+              "card": $card
+            }')
+          
+          RESP=$(curl -sS -w "\n%{http_code}" -X POST \
+            'https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id' \
+            -H "Authorization: Bearer $TAT" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "$PAYLOAD")
+          
+          HTTP_CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | head -n-1)
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Failed to send message. HTTP $HTTP_CODE"
+            echo "$BODY"
+            exit 1
+          fi
+          
+          MESSAGE_ID=$(echo "$BODY" | jq -r '.data.message_id // empty')
+          if [ -z "$MESSAGE_ID" ]; then
+            echo "No message_id in response"
+            echo "$BODY"
+            exit 1
+          fi
+          
+          echo "message_id=$MESSAGE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Approval card sent to Lark"
+
+  wait_approval:
+    needs: [create_gate, notify_approval]
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.wait.outputs.approved }}
+    steps:
+      - name: Wait for approval
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const issueNumber = parseInt('${{ needs.create_gate.outputs.issue_number }}');
+            const maxAttempts = 120;
+            let attempts = 0;
+            
+            while (attempts < maxAttempts) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              for (const comment of comments) {
+                const body = comment.body;
+                if (body.includes('[APPROVED]') || body.includes('approved')) {
+                  core.setOutput('approved', 'true');
+                  console.log('✅ Deployment approved');
+                  return;
+                } else if (body.includes('[REJECTED]') || body.includes('rejected')) {
+                  core.setFailed('❌ Deployment rejected');
+                  return;
+                }
+              }
+              
+              attempts++;
+              await new Promise(resolve => setTimeout(resolve, 30000));
+            }
+            
+            core.setFailed('⏱️ Approval timeout (60 minutes)');
