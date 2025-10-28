@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tk-rendering-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "vars": {
+    "IMAGE_SERVICE_URL": "http://tk2cdn.ai4funs.com/",
+    "RENDERING_API_URL": "https://rc.tkonline.cc/rendering-client/rendering"
+  },
+  "env": {
+    "dev": {
+      "vars": {
+        "IMAGE_SERVICE_URL": "https://stt.pwtk.cc/",
+        "RENDERING_API_URL": "https://rendering-client.pwtk.cc/rendering-client/rendering"
+      }
+    }
+  }
+}
